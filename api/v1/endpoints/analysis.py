@@ -75,6 +75,7 @@ from src.utils.data_processing import (
     parse_json_field,
     extract_fundamental_detail_fields,
     extract_board_detail_fields,
+    extract_realtime_detail_fields,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+\u3400-\u9fff\s]+$")
+
+
+def _get_task_trace_id(task: Any) -> Optional[str]:
+    trace_id = getattr(task, "trace_id", None)
+    if isinstance(trace_id, str) and trace_id.strip():
+        return trace_id
+    task_id = getattr(task, "task_id", None)
+    if isinstance(task_id, str) and task_id.strip():
+        return task_id
+    return None
 
 
 def _market_review_lock_path(config: Config) -> Path:
@@ -343,6 +354,7 @@ def _handle_async_analysis_batch(
     accepted = [
         BatchTaskAcceptedItem(
             task_id=task.task_id,
+            trace_id=_get_task_trace_id(task),
             stock_code=task.stock_code,
             status="pending",
             message=f"分析任务已加入队列: {task.stock_code}",
@@ -376,6 +388,7 @@ def _handle_async_analysis_batch(
     if len(stock_codes) == 1 and accepted:
         task_accepted = TaskAccepted(
             task_id=accepted[0].task_id,
+            trace_id=accepted[0].trace_id,
             status="pending",
             message=accepted[0].message,
         )
@@ -448,6 +461,7 @@ def _handle_sync_analysis(
 
         return AnalysisResultResponse(
             query_id=query_id,
+            trace_id=result.get("trace_id") or query_id,
             stock_code=result.get("stock_code", stock_code),
             stock_name=result.get("stock_name"),
             report=report.model_dump() if report else None,
@@ -496,6 +510,7 @@ def trigger_market_review(
             status="accepted",
             message="今日大盘复盘相关市场均为非交易日，已跳过大盘复盘",
             send_notification=request.send_notification,
+            trace_id=None,
         )
 
     lock_token = _try_acquire_market_review_lock(config)
@@ -532,6 +547,7 @@ def trigger_market_review(
         message="大盘复盘任务已提交，完成后会保存报告并按配置推送通知",
         send_notification=request.send_notification,
         task_id=task.task_id,
+        trace_id=_get_task_trace_id(task),
     )
 
 
@@ -582,6 +598,7 @@ def get_task_list(
     task_infos = [
         TaskInfo(
             task_id=t.task_id,
+            trace_id=_get_task_trace_id(t),
             stock_code=t.stock_code,
             stock_name=t.stock_name,
             status=t.status.value,
@@ -722,6 +739,8 @@ def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
     payload = dict(task.result)
     if not payload.get("query_id"):
         payload["query_id"] = task.task_id
+    if not payload.get("trace_id"):
+        payload["trace_id"] = _get_task_trace_id(task) or task.task_id
     if not payload.get("stock_code"):
         payload["stock_code"] = task.stock_code
 
@@ -735,6 +754,32 @@ def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
             or _datetime_to_iso(getattr(task, "completed_at", None))
             or datetime.now().isoformat()
         )
+
+    report_data = payload.get("report")
+    stock_code = payload.get("stock_code")
+    query_id = payload.get("query_id")
+    if isinstance(report_data, dict) and stock_code and query_id:
+        context_snapshot, fundamental_snapshot = _load_sync_fundamental_sources(
+            query_id=query_id,
+            stock_code=stock_code,
+        )
+        if context_snapshot is not None or fundamental_snapshot is not None:
+            try:
+                report = _build_analysis_report(
+                    report_data,
+                    query_id,
+                    stock_code,
+                    payload.get("stock_name") or getattr(task, "stock_name", None),
+                    context_snapshot=context_snapshot,
+                    fallback_fundamental_payload=fundamental_snapshot,
+                )
+                payload["report"] = report.model_dump()
+            except Exception as e:
+                logger.debug(
+                    "enrich in-memory task report failed (fail-open): task_id=%s err=%s",
+                    getattr(task, "task_id", None),
+                    e,
+                )
 
     return AnalysisResultResponse.model_validate(payload)
 
@@ -792,6 +837,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
 
         return TaskStatus(
             task_id=task.task_id,
+            trace_id=_get_task_trace_id(task),
             status=task.status.value,
             progress=task.progress,
             result=result,
@@ -823,6 +869,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
 
                 return TaskStatus(
                     task_id=task_id,
+                    trace_id=task_id,
                     status="completed",
                     progress=100,
                     result=None,
@@ -840,25 +887,39 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             stock_name = get_localized_stock_name(record.name, record.code, report_language)
 
             # Extract current_price / change_pct from context_snapshot
-            current_price = None
-            change_pct = None
             skills = None
             context_snapshot = parse_json_field(getattr(record, 'context_snapshot', None))
             if context_snapshot and isinstance(context_snapshot, dict):
                 raw_skills = context_snapshot.get("skills")
                 if isinstance(raw_skills, list):
                     skills = [str(skill) for skill in raw_skills]
-                enhanced_context = context_snapshot.get('enhanced_context') or {}
-                realtime = enhanced_context.get('realtime') or {}
-                current_price = realtime.get('price')
-                change_pct = realtime.get('change_pct')
-                realtime_quote_raw = context_snapshot.get('realtime_quote_raw') or {}
-                if current_price is None:
-                    current_price = realtime_quote_raw.get('price')
-                if change_pct is None:
-                    change_pct = realtime_quote_raw.get('change_pct')
-                if change_pct is None:
-                    change_pct = realtime_quote_raw.get('pct_chg')
+            realtime_fields = extract_realtime_detail_fields(context_snapshot)
+            current_price = realtime_fields.get("current_price")
+            change_pct = realtime_fields.get("change_pct")
+            fallback_fundamental = db.get_latest_fundamental_snapshot(
+                query_id=task_id,
+                code=record.code,
+            )
+            extracted_fundamental = extract_fundamental_detail_fields(
+                context_snapshot=context_snapshot,
+                fallback_fundamental_payload=fallback_fundamental,
+            )
+            extracted_boards = extract_board_detail_fields(
+                context_snapshot=context_snapshot,
+                fallback_fundamental_payload=fallback_fundamental,
+            )
+            has_board_details = bool(extracted_boards.get("belong_boards")) or extracted_boards.get("sector_rankings") is not None
+            details = None
+            if any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None:
+                details = ReportDetails(
+                    news_content=getattr(record, "news_content", None),
+                    raw_result=raw_result,
+                    context_snapshot=context_snapshot,
+                    financial_report=extracted_fundamental.get("financial_report"),
+                    dividend_metrics=extracted_fundamental.get("dividend_metrics"),
+                    belong_boards=extracted_boards.get("belong_boards"),
+                    sector_rankings=extracted_boards.get("sector_rankings"),
+                )
 
             # Build report from DB record so completed tasks return real data
             report_dict = AnalysisReport(
@@ -886,13 +947,16 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     stop_loss=_stringify_report_strategy_value(getattr(record, 'stop_loss', None)),
                     take_profit=_stringify_report_strategy_value(getattr(record, 'take_profit', None)),
                 ),
+                details=details,
             ).model_dump()
             return TaskStatus(
                 task_id=task_id,
+                trace_id=task_id,
                 status="completed",
                 progress=100,
                 result=AnalysisResultResponse(
                     query_id=task_id,
+                    trace_id=task_id,
                     stock_code=record.code,
                     stock_name=stock_name,
                     report=report_dict,
@@ -1001,6 +1065,13 @@ def _build_analysis_report(
         meta_data.get("stock_code", stock_code),
         report_language,
     )
+    realtime_fields = extract_realtime_detail_fields(context_snapshot)
+    current_price = meta_data.get("current_price")
+    if current_price is None:
+        current_price = realtime_fields.get("current_price")
+    change_pct = meta_data.get("change_pct")
+    if change_pct is None:
+        change_pct = realtime_fields.get("change_pct")
 
     meta = ReportMeta(
         query_id=meta_data.get("query_id", query_id),
@@ -1009,8 +1080,8 @@ def _build_analysis_report(
         report_type=meta_data.get("report_type", "detailed"),
         report_language=report_language,
         created_at=meta_data.get("created_at", datetime.now().isoformat()),
-        current_price=meta_data.get("current_price"),
-        change_pct=meta_data.get("change_pct"),
+        current_price=current_price,
+        change_pct=change_pct,
         model_used=normalize_model_used(meta_data.get("model_used")),
     )
 
