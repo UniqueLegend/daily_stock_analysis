@@ -37,6 +37,14 @@ const overview: AnalysisContextPackOverview = {
       warnings: ['news_provider_timeout'],
       missingReasons: ['news_context_missing'],
     },
+    {
+      key: 'fundamentals',
+      label: '基本面',
+      status: 'fetch_failed',
+      source: 'fundamental_pipeline',
+      warnings: [],
+      missingReasons: ['fundamental_pipeline_failed'],
+    },
   ],
   counts: {
     available: 1,
@@ -46,6 +54,20 @@ const overview: AnalysisContextPackOverview = {
     stale: 0,
     estimated: 0,
     partial: 0,
+    fetchFailed: 1,
+  },
+  dataQuality: {
+    overallScore: 82,
+    level: 'usable',
+    blockScores: {
+      quote: 100,
+      daily_bars: 100,
+      technical: 100,
+      news: 35,
+      fundamentals: 25,
+      chip: 100,
+    },
+    limitations: ['fundamentals: fetch_failed'],
   },
   warnings: ['intraday_realtime_overlay'],
   metadata: {
@@ -67,6 +89,8 @@ describe('AnalysisContextSummary', () => {
     expect(within(panel).getAllByText('输入数据块')[0]).toBeVisible();
     expect(screen.getAllByText('可用 1')[0]).toBeVisible();
     expect(screen.getAllByText('缺失 1')[0]).toBeVisible();
+    expect(screen.getAllByText('抓取失败 1')[0]).toBeVisible();
+    expect(screen.getAllByText('质量分 82/100 可用')[0]).toBeVisible();
     expect(screen.getByText('触发来源: api')).toBeVisible();
     expect(screen.getByText('来源: mock_quote')).not.toBeVisible();
 
@@ -77,9 +101,13 @@ describe('AnalysisContextSummary', () => {
     expect(screen.getByText('来源: mock_quote')).toBeVisible();
     expect(screen.getByText('告警:')).toBeInTheDocument();
     expect(screen.getByText(/intraday_realtime_overlay/)).toBeInTheDocument();
+    expect(screen.getByText('数据限制:')).toBeInTheDocument();
+    expect(screen.getByText(/基本面：抓取失败/)).toBeInTheDocument();
     expect(screen.getByText(/news_provider_timeout/)).toBeInTheDocument();
-    expect(screen.getByText(/news_context_missing/)).toBeInTheDocument();
+    expect(screen.getByText(/未进入分析输入 \(news_context_missing\)/)).toBeInTheDocument();
+    expect(screen.getByText(/fundamental_pipeline_failed/)).toBeInTheDocument();
     expect(screen.getAllByText('新闻结果数: 3').some((item) => item.textContent === '新闻结果数: 3')).toBe(true);
+    expect(screen.getAllByText('本次分析输入')[0]).toBeVisible();
   });
 
   it('localizes the collapsed summary for english reports', () => {
@@ -88,9 +116,17 @@ describe('AnalysisContextSummary', () => {
     const panel = screen.getByTestId('analysis-context-summary');
     expect(panel).not.toHaveAttribute('open');
     expect(screen.getAllByText('Input Blocks')[0]).toBeVisible();
+    expect(screen.getByText('Shows inputs included in this LLM run, not provider run success')).toBeVisible();
     expect(screen.getAllByText('Available 1')[0]).toBeVisible();
     expect(screen.getAllByText('Missing 1')[0]).toBeVisible();
+    expect(screen.getAllByText('Fetch failed 1')[0]).toBeVisible();
+    expect(screen.getAllByText('Quality 82/100 Usable')[0]).toBeVisible();
     expect(screen.getByText('Trigger: api')).toBeVisible();
+
+    fireEvent.click(within(panel).getAllByText('Input Blocks')[0]);
+
+    expect(screen.getByText('Data Limitations:')).toBeInTheDocument();
+    expect(screen.getByText(/fundamentals: Fetch failed/)).toBeInTheDocument();
   });
 
   it('surfaces degraded non-zero states in the collapsed summary', () => {
@@ -122,6 +158,7 @@ describe('AnalysisContextSummary', () => {
         stale: 1,
         estimated: 0,
         partial: 0,
+        fetchFailed: 0,
       },
     };
 
@@ -189,6 +226,21 @@ describe('ReportSummary analysis context placement', () => {
         reportType: 'detailed',
         reportLanguage: 'zh',
         createdAt: '2026-04-10T12:00:00',
+        marketPhaseSummary: {
+          market: 'cn',
+          phase: 'intraday',
+          marketLocalTime: '2026-04-10T10:30:00+08:00',
+          sessionDate: '2026-04-10',
+          effectiveDailyBarDate: '2026-04-09',
+          isTradingDay: true,
+          isMarketOpenNow: true,
+          isPartialBar: true,
+          minutesToOpen: null,
+          minutesToClose: 150,
+          triggerSource: 'api',
+          analysisIntent: 'auto',
+          warnings: [],
+        },
       },
       summary: {
         analysisSummary: 'summary',
@@ -224,10 +276,16 @@ describe('ReportSummary analysis context placement', () => {
       expect(screen.getByText('暂无相关资讯')).toBeInTheDocument();
     });
 
+    expect(screen.getByText('市场阶段: CN · 盘中')).toBeInTheDocument();
+    expect(screen.getByText('日线未完成')).toBeInTheDocument();
+    expect(screen.getAllByText('质量分 82/100 可用')[0]).toBeInTheDocument();
+
     const strategy = screen.getByText('狙击点位');
     const news = screen.getByText('相关资讯');
     const diagnostics = screen.getByTestId('run-diagnostics');
     const contextSummary = screen.getByTestId('analysis-context-summary');
+    expect(contextSummary).not.toHaveAttribute('open');
+    expect(diagnostics).not.toHaveAttribute('open');
     const traceability = screen.getByText('数据追溯');
 
     expect(strategy.compareDocumentPosition(news) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

@@ -4,18 +4,22 @@ import { BarChart3, Check, SlidersHorizontal } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
+import { historyApi } from '../api/history';
 import { agentApi, type SkillInfo } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
-import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
+import { ApiErrorAlert, Button, EmptyState, InlineAlert } from '../components/common';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
-import { HistoryList, StockHistoryTrendDrawer } from '../components/history';
+import { StockHistoryTrendDrawer, StockBar } from '../components/history';
 import { ReportMarkdownDrawer } from '../components/report/ReportMarkdownDrawer';
+import { MarketReviewReportView } from '../components/report/MarketReviewReportView';
 import { ReportSummary } from '../components/report/ReportSummary';
 import { TaskPanel } from '../components/tasks';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { useWatchlist } from '../hooks/useWatchlist';
 import type { SetupStatusResponse } from '../types/systemConfig';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
+import type { MarketReviewPayload, StockBarItem } from '../types/analysis';
 
 type MarketReviewNotice = {
   variant: 'success' | 'warning' | 'danger';
@@ -26,12 +30,11 @@ type MarketReviewNotice = {
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isSubmittingMarketReview, setIsSubmittingMarketReview] = useState(false);
   const [marketReviewNotice, setMarketReviewNotice] = useState<MarketReviewNotice>(null);
   const [marketReviewError, setMarketReviewError] = useState<ParsedApiError | null>(null);
   const [marketReviewReport, setMarketReviewReport] = useState<string | null>(null);
-  const [marketReviewReportCopied, setMarketReviewReportCopied] = useState(false);
+  const [marketReviewPayload, setMarketReviewPayload] = useState<MarketReviewPayload | null>(null);
   const [analysisSkills, setAnalysisSkills] = useState<SkillInfo[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState('');
   const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
@@ -72,15 +75,10 @@ const HomePage: React.FC = () => {
     duplicateError,
     error,
     isAnalyzing,
-    historyItems,
-    selectedHistoryIds,
-    isDeletingHistory,
-    isLoadingHistory,
-    isLoadingMore,
-    hasMore,
     selectedReport,
     isLoadingReport,
     isHistoryTrendOpen,
+    marketReviewHistoryItems,
     stockHistoryItems,
     stockHistoryTotal,
     stockHistoryHasMore,
@@ -94,11 +92,9 @@ const HomePage: React.FC = () => {
     clearError,
     loadInitialHistory,
     refreshHistory,
-    loadMoreHistory,
+    loadMarketReviewHistory,
+    refreshMarketReviewHistory,
     selectHistoryItem,
-    toggleHistorySelection,
-    toggleSelectAllVisible,
-    deleteSelectedHistory,
     submitAnalysis,
     notify,
     setNotify,
@@ -113,7 +109,10 @@ const HomePage: React.FC = () => {
     closeHistoryTrend,
     setStockHistoryRange,
     loadMoreStockHistory,
-    selectedIds,
+    stockBarItems,
+    isLoadingStockBar,
+    loadStockBar,
+    refreshStockBar,
   } = useHomeDashboardState();
 
   useEffect(() => {
@@ -182,10 +181,10 @@ const HomePage: React.FC = () => {
   }, [analysisSkills, selectedStrategyId]);
 
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
+  const liveMarketReviewLanguage = normalizeReportLanguage(marketReviewPayload?.language);
   const reportText = getReportText(reportLanguage);
   const isMarketReviewHistoryReport = selectedReport?.meta.reportType === 'market_review';
-  const isHistoryTrendUnavailable = !selectedReport || selectedReport.meta.reportType === 'market_review'
-    || !selectedReport.meta.stockCode;
+  const isHistoryTrendUnavailable = !selectedReport || !selectedReport.meta.stockCode;
 
   useEffect(() => {
     if (!isHistoryTrendUnavailable || !isHistoryTrendOpen) {
@@ -311,6 +310,10 @@ const HomePage: React.FC = () => {
   useDashboardLifecycle({
     loadInitialHistory,
     refreshHistory,
+    loadMarketReviewHistory,
+    refreshMarketReviewHistory,
+    loadStockBar,
+    refreshStockBar,
     syncTaskCreated,
     syncTaskUpdated,
     syncTaskFailed,
@@ -318,10 +321,39 @@ const HomePage: React.FC = () => {
     removeTask,
   });
 
+  const watchlistState = useWatchlist();
+
+  const clearMarketReviewState = useCallback(() => {
+    stopMarketReviewPolling();
+    setMarketReviewReport(null);
+    setMarketReviewPayload(null);
+    setMarketReviewNotice(null);
+    setMarketReviewError(null);
+  }, [stopMarketReviewPolling]);
+
   const handleHistoryItemClick = useCallback((recordId: number) => {
+    clearMarketReviewState();
     void selectHistoryItem(recordId);
     setSidebarOpen(false);
-  }, [selectHistoryItem]);
+  }, [clearMarketReviewState, selectHistoryItem]);
+
+  const [isDeletingStock, setIsDeletingStock] = useState(false);
+  const handleDeleteStock = useCallback(async (stockCode: string) => {
+    if (isDeletingStock) return;
+    setIsDeletingStock(true);
+    try {
+      await historyApi.deleteByCode(stockCode);
+      await refreshStockBar();
+      await refreshHistory(true);
+      if (stockCode === 'MARKET') {
+        await refreshMarketReviewHistory(false);
+      }
+    } catch {
+      // error silently ignored
+    } finally {
+      setIsDeletingStock(false);
+    }
+  }, [isDeletingStock, refreshMarketReviewHistory, refreshStockBar, refreshHistory]);
 
   const handleSubmitAnalysis = useCallback(
     (
@@ -378,6 +410,7 @@ const HomePage: React.FC = () => {
         if (attempts >= maxAttempts) {
           stopMarketReviewPolling();
           setMarketReviewReport(null);
+          setMarketReviewPayload(null);
           setMarketReviewNotice({
             variant: 'danger',
             title: '大盘复盘已超时',
@@ -393,6 +426,7 @@ const HomePage: React.FC = () => {
           const status = await analysisApi.getStatus(taskId);
           if (status.status === 'pending' || status.status === 'processing') {
             setMarketReviewReport(null);
+            setMarketReviewPayload(null);
             const progress = typeof status.progress === 'number'
               ? `${status.progress}%`
               : '进行中';
@@ -410,12 +444,14 @@ const HomePage: React.FC = () => {
               ? status.marketReviewReport
               : '';
             setMarketReviewReport(marketReviewText ? marketReviewText.trim() : null);
+            setMarketReviewPayload(status.marketReviewPayload ?? null);
             setMarketReviewNotice({
               variant: 'success',
               title: '大盘复盘已完成',
               message: marketReviewText ? '大盘复盘任务已完成，结果如下：' : '大盘复盘任务已完成，结果已生成并按配置推送。',
             });
             setMarketReviewError(null);
+            await refreshMarketReviewHistory(true);
             scrollMarketReviewFeedbackIntoView();
             return false;
           }
@@ -423,6 +459,7 @@ const HomePage: React.FC = () => {
           if (status.status === 'failed') {
             stopMarketReviewPolling();
             setMarketReviewReport(null);
+            setMarketReviewPayload(null);
             setMarketReviewError(
               getParsedApiError({
                 response: {
@@ -441,6 +478,7 @@ const HomePage: React.FC = () => {
 
           stopMarketReviewPolling();
           setMarketReviewReport(null);
+          setMarketReviewPayload(null);
           setMarketReviewNotice({
             variant: 'danger',
             title: '大盘复盘状态异常',
@@ -453,6 +491,7 @@ const HomePage: React.FC = () => {
           if (attempts >= maxAttempts) {
             stopMarketReviewPolling();
             setMarketReviewReport(null);
+            setMarketReviewPayload(null);
             setMarketReviewError(parsed);
             setMarketReviewNotice(null);
             scrollMarketReviewFeedbackIntoView();
@@ -474,7 +513,7 @@ const HomePage: React.FC = () => {
         }, intervalMs);
       }
     },
-    [scrollMarketReviewFeedbackIntoView, stopMarketReviewPolling],
+    [refreshMarketReviewHistory, scrollMarketReviewFeedbackIntoView, stopMarketReviewPolling],
   );
 
   const handleTriggerMarketReview = useCallback(async () => {
@@ -482,6 +521,7 @@ const HomePage: React.FC = () => {
     setMarketReviewNotice(null);
     setMarketReviewError(null);
     setMarketReviewReport(null);
+    setMarketReviewPayload(null);
     scrollMarketReviewFeedbackIntoView();
     try {
       const result = await analysisApi.triggerMarketReview({ sendNotification: notify });
@@ -504,61 +544,58 @@ const HomePage: React.FC = () => {
     }
   }, [notify, pollMarketReviewStatus, scrollMarketReviewFeedbackIntoView]);
 
-  const handleCopyMarketReviewReport = useCallback(() => {
-    if (!marketReviewReport) {
-      return;
+  const mergedStockBarItems = useMemo<StockBarItem[]>(() => {
+    const latestMarketReview = marketReviewHistoryItems[0];
+    const stockItems = stockBarItems.filter((item) => item.stockCode !== 'MARKET');
+    if (!latestMarketReview) {
+      return stockItems;
     }
 
-    void navigator.clipboard.writeText(marketReviewReport).then(
-      () => {
-        setMarketReviewReportCopied(true);
-        setTimeout(() => setMarketReviewReportCopied(false), 2000);
-      },
-      (err) => {
-        console.error('复制失败:', err);
-      },
-    );
-  }, [marketReviewReport]);
+    const marketReviewItem: StockBarItem = {
+      id: latestMarketReview.id,
+      stockCode: 'MARKET',
+      stockName: latestMarketReview.stockName || '大盘复盘',
+      reportType: 'market_review',
+      sentimentScore: latestMarketReview.sentimentScore,
+      operationAdvice: latestMarketReview.operationAdvice,
+      analysisCount: Math.max(marketReviewHistoryItems.length, 1),
+      lastAnalysisTime: latestMarketReview.createdAt,
+      modelUsed: latestMarketReview.modelUsed,
+      marketPhaseSummary: latestMarketReview.marketPhaseSummary,
+    };
 
-  const handleDeleteSelectedHistory = useCallback(() => {
-    void deleteSelectedHistory();
-    setShowDeleteConfirm(false);
-  }, [deleteSelectedHistory]);
+    return [marketReviewItem, ...stockItems].sort((left, right) => {
+      const leftTime = left.lastAnalysisTime ? Date.parse(left.lastAnalysisTime) : 0;
+      const rightTime = right.lastAnalysisTime ? Date.parse(right.lastAnalysisTime) : 0;
+      return rightTime - leftTime;
+    });
+  }, [marketReviewHistoryItems, stockBarItems]);
 
   const sidebarContent = useMemo(
     () => (
       <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
         <TaskPanel tasks={activeTasks} />
-        <HistoryList
-          items={historyItems}
-          isLoading={isLoadingHistory}
-          isLoadingMore={isLoadingMore}
-          hasMore={hasMore}
-          selectedId={selectedReport?.meta.id}
-          selectedIds={selectedIds}
-          isDeleting={isDeletingHistory}
+        <StockBar
+          items={mergedStockBarItems}
+          isLoading={isLoadingStockBar}
+          selectedStockCode={selectedReport?.meta.stockCode}
+          selectedRecordId={selectedReport?.meta.id}
           onItemClick={handleHistoryItemClick}
-          onLoadMore={() => void loadMoreHistory()}
-          onToggleItemSelection={toggleHistorySelection}
-          onToggleSelectAll={toggleSelectAllVisible}
-          onDeleteSelected={() => setShowDeleteConfirm(true)}
+          onDeleteStock={handleDeleteStock}
+          isDeleting={isDeletingStock}
           className="flex-1 overflow-hidden"
         />
       </div>
     ),
     [
       activeTasks,
-      hasMore,
-      historyItems,
-      isDeletingHistory,
-      isLoadingHistory,
-      isLoadingMore,
+      mergedStockBarItems,
+      isLoadingStockBar,
       handleHistoryItemClick,
-      loadMoreHistory,
-      selectedIds,
+      handleDeleteStock,
+      isDeletingStock,
+      selectedReport?.meta.stockCode,
       selectedReport?.meta.id,
-      toggleHistorySelection,
-      toggleSelectAllVisible,
     ],
   );
 
@@ -779,25 +816,12 @@ const HomePage: React.FC = () => {
             ) : null}
 
             {marketReviewReport ? (
-              <div className="mb-3 rounded-xl border border-subtle bg-surface/70 px-3 py-3 text-xs text-secondary-text shadow-sm">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <p className="font-semibold text-foreground">大盘复盘报告</p>
-                  <button
-                    type="button"
-                    className="home-surface-button h-7 rounded-md px-3 py-1 text-xs text-foreground"
-                    disabled={marketReviewReportCopied}
-                    onClick={() => void handleCopyMarketReviewReport()}
-                  >
-                    {marketReviewReportCopied ? '已复制' : '复制'}
-                  </button>
-                </div>
-                <pre
-                  data-testid="market-review-report"
-                  className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-background px-3 py-2 leading-relaxed"
-                >
-                  {marketReviewReport}
-                </pre>
-              </div>
+              <MarketReviewReportView
+                content={marketReviewReport}
+                payload={marketReviewPayload}
+                reportLanguage={liveMarketReviewLanguage}
+                className="mb-3"
+              />
             ) : null}
 
             {error ? (
@@ -807,39 +831,55 @@ const HomePage: React.FC = () => {
                 onDismiss={clearError}
               />
             ) : null}
-            {isLoadingReport ? (
+            {!marketReviewReport && isLoadingReport ? (
               <div className="flex h-full flex-col items-center justify-center">
                 <DashboardStateBlock title="加载报告中..." loading />
               </div>
-            ) : selectedReport ? (
+            ) : !marketReviewReport && selectedReport ? (
               <div className={isHistoryTrendOpen ? 'max-w-6xl space-y-4 pb-8' : 'max-w-4xl space-y-4 pb-8'}>
                 <div className="flex flex-wrap items-center justify-end gap-2">
+                  {!isMarketReviewHistoryReport ? (
+                    <>
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        disabled={isAnalyzing || selectedReport.meta.id === undefined}
+                        onClick={handleReanalyze}
+                      >
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                        {reportText.reanalyze}
+                      </Button>
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        disabled={selectedReport.meta.id === undefined}
+                        onClick={handleAskFollowUp}
+                      >
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                        追问 AI
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="home-action-ai"
+                      size="sm"
+                      disabled={isSubmittingMarketReview}
+                      isLoading={isSubmittingMarketReview}
+                      loadingText="提交中"
+                      onClick={() => void handleTriggerMarketReview()}
+                    >
+                      <BarChart3 className="h-4 w-4" />
+                      重新复盘
+                    </Button>
+                  )}
                   <Button
                     variant="home-action-ai"
                     size="sm"
-                    disabled={isAnalyzing || selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
-                    onClick={handleReanalyze}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                    {reportText.reanalyze}
-                  </Button>
-                  <Button
-                    variant="home-action-ai"
-                    size="sm"
-                    disabled={selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
-                    onClick={handleAskFollowUp}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                    </svg>
-                    追问 AI
-                  </Button>
-                  <Button
-                    variant="home-action-ai"
-                    size="sm"
-                    disabled={selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
+                    disabled={selectedReport.meta.id === undefined || isHistoryTrendUnavailable}
                     className={isHistoryTrendOpen ? 'border-primary/70 bg-primary/15 text-primary shadow-glow-cyan' : undefined}
                     onClick={() => {
                       if (isHistoryTrendOpen) {
@@ -882,10 +922,19 @@ const HomePage: React.FC = () => {
                     onRetry={() => void openHistoryTrend()}
                   />
                 ) : (
-                  <ReportSummary data={selectedReport} isHistory />
+                  <ReportSummary
+                    data={selectedReport}
+                    isHistory
+                    watchlist={{
+                      isInWatchlist: watchlistState.isInWatchlist,
+                      onToggle: watchlistState.toggleWatchlist,
+                      isActioning: watchlistState.isActioning,
+                      actionMessage: watchlistState.actionMessage,
+                    }}
+                  />
                 )}
               </div>
-            ) : (
+            ) : !marketReviewReport ? (
               <div className="flex h-full items-center justify-center">
                 <EmptyState
                   title="开始分析"
@@ -898,7 +947,7 @@ const HomePage: React.FC = () => {
                   )}
                 />
               </div>
-            )}
+            ) : null}
           </section>
         </div>
       </div>
@@ -914,20 +963,6 @@ const HomePage: React.FC = () => {
         />
       ) : null}
 
-      <ConfirmDialog
-        isOpen={showDeleteConfirm}
-        title="删除历史记录"
-        message={
-          selectedHistoryIds.length === 1
-            ? '确认删除这条历史记录吗？删除后将不可恢复。'
-            : `确认删除选中的 ${selectedHistoryIds.length} 条历史记录吗？删除后将不可恢复。`
-        }
-        confirmText={isDeletingHistory ? '删除中...' : '确认删除'}
-        cancelText="取消"
-        isDanger={true}
-        onConfirm={handleDeleteSelectedHistory}
-        onCancel={() => setShowDeleteConfirm(false)}
-      />
     </div>
   );
 };

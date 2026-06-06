@@ -25,6 +25,33 @@ const STATUS_STYLE: Record<AnalysisContextPackBlockStatus, { variant: BadgeVaria
   stale: { variant: 'warning', tone: 'warning' },
   estimated: { variant: 'info', tone: 'info' },
   partial: { variant: 'warning', tone: 'warning' },
+  fetch_failed: { variant: 'danger', tone: 'danger' },
+};
+
+const QUALITY_STYLE = {
+  good: { variant: 'success', tone: 'success' },
+  usable: { variant: 'info', tone: 'info' },
+  limited: { variant: 'warning', tone: 'warning' },
+  poor: { variant: 'danger', tone: 'danger' },
+} as const satisfies Record<string, { variant: BadgeVariant; tone: StatusTone }>;
+
+const BLOCK_LABELS: Record<ReportLanguage, Record<string, string>> = {
+  zh: {
+    quote: '行情',
+    daily_bars: '日线',
+    technical: '技术',
+    news: '新闻',
+    fundamentals: '基本面',
+    chip: '筹码',
+  },
+  en: {
+    quote: 'quote',
+    daily_bars: 'daily bars',
+    technical: 'technical',
+    news: 'news',
+    fundamentals: 'fundamentals',
+    chip: 'chip',
+  },
 };
 
 const TEXT = {
@@ -35,8 +62,18 @@ const TEXT = {
     source: '来源',
     warnings: '告警',
     missingReasons: '缺失原因',
+    inputScope: '本次分析输入',
+    evidenceScope: '仅代表进入本次 LLM 的输入，不等同于数据源运行成功',
+    qualityScore: '质量分',
+    limitations: '数据限制',
     newsResultCount: '新闻结果数',
     triggerSource: '触发来源',
+    qualityLevel: {
+      good: '良好',
+      usable: '可用',
+      limited: '受限',
+      poor: '较差',
+    },
     status: {
       available: '可用',
       missing: '缺失',
@@ -45,6 +82,7 @@ const TEXT = {
       stale: '过期',
       estimated: '估算',
       partial: '部分可用',
+      fetch_failed: '抓取失败',
     },
   },
   en: {
@@ -54,8 +92,18 @@ const TEXT = {
     source: 'Source',
     warnings: 'Warnings',
     missingReasons: 'Missing Reasons',
+    inputScope: 'Analysis Input',
+    evidenceScope: 'Shows inputs included in this LLM run, not provider run success',
+    qualityScore: 'Quality',
+    limitations: 'Data Limitations',
     newsResultCount: 'News Results',
     triggerSource: 'Trigger',
+    qualityLevel: {
+      good: 'Good',
+      usable: 'Usable',
+      limited: 'Limited',
+      poor: 'Poor',
+    },
     status: {
       available: 'Available',
       missing: 'Missing',
@@ -64,13 +112,38 @@ const TEXT = {
       stale: 'Stale',
       estimated: 'Estimated',
       partial: 'Partial',
+      fetch_failed: 'Fetch failed',
     },
   },
 } as const;
 
+const MISSING_REASON_LABELS: Record<ReportLanguage, Record<string, string>> = {
+  zh: {
+    daily_bars_missing: '未进入分析输入',
+    news_context_missing: '未进入分析输入',
+    realtime_quote_missing: '未进入分析输入',
+    trend_result_missing: '未进入分析输入',
+    fundamental_context_missing: '未进入分析输入',
+    chip_distribution_missing: '未进入分析输入',
+    today_missing: '今日数据未进入分析输入',
+    yesterday_missing: '昨日数据未进入分析输入',
+  },
+  en: {
+    daily_bars_missing: 'Not included in analysis input',
+    news_context_missing: 'Not included in analysis input',
+    realtime_quote_missing: 'Not included in analysis input',
+    trend_result_missing: 'Not included in analysis input',
+    fundamental_context_missing: 'Not included in analysis input',
+    chip_distribution_missing: 'Not included in analysis input',
+    today_missing: 'Today data not included in analysis input',
+    yesterday_missing: 'Yesterday data not included in analysis input',
+  },
+};
+
 const STATUS_ORDER: AnalysisContextPackBlockStatus[] = [
   'available',
   'missing',
+  'fetch_failed',
   'not_supported',
   'fallback',
   'stale',
@@ -85,7 +158,36 @@ const getCount = (
   if (status === 'not_supported') {
     return overview.counts.notSupported || 0;
   }
+  if (status === 'fetch_failed') {
+    return overview.counts.fetchFailed || 0;
+  }
   return overview.counts[status] || 0;
+};
+
+const formatLimitation = (
+  value: string,
+  language: ReportLanguage,
+  text: typeof TEXT.zh | typeof TEXT.en,
+): string => {
+  const [rawKey, ...statusParts] = value.split(':');
+  if (!rawKey || statusParts.length === 0) {
+    return value;
+  }
+
+  const key = rawKey.trim();
+  const status = statusParts.join(':').trim();
+  if (!key || !status) {
+    return value;
+  }
+
+  const label = BLOCK_LABELS[language][key] || key;
+  const statusLabel = (text.status as Record<string, string>)[status] || status;
+  return language === 'zh' ? `${label}：${statusLabel}` : `${label}: ${statusLabel}`;
+};
+
+const formatMissingReason = (reason: string, language: ReportLanguage): string => {
+  const label = MISSING_REASON_LABELS[language][reason];
+  return label ? `${label} (${reason})` : reason;
 };
 
 export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
@@ -111,6 +213,11 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
       : null,
   ].filter((item): item is string => Boolean(item));
   const triggerSource = overview.metadata?.triggerSource?.trim();
+  const quality = overview.dataQuality;
+  const qualityLevel = quality?.level || undefined;
+  const qualityStyle = qualityLevel ? QUALITY_STYLE[qualityLevel] : undefined;
+  const qualityLabel = qualityLevel ? text.qualityLevel[qualityLevel] : undefined;
+  const limitations = quality?.limitations?.map((item) => formatLimitation(item, reportLanguage, text)) || [];
 
   return (
     <Card variant="bordered" padding="none" className="home-panel-card">
@@ -125,9 +232,18 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
               <span className="mt-0.5 block truncate text-base font-semibold text-foreground">
                 {text.title}
               </span>
+              <span className="mt-1 block text-xs leading-5 text-muted-text">
+                {text.evidenceScope}
+              </span>
             </span>
           </div>
           <span className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+            {typeof quality?.overallScore === 'number' ? (
+              <Badge variant={qualityStyle?.variant || 'default'} className="gap-1.5 shadow-none">
+                {qualityStyle ? <StatusDot tone={qualityStyle.tone} className="h-1.5 w-1.5" /> : null}
+                {text.qualityScore} {quality.overallScore}/100{qualityLabel ? ` ${qualityLabel}` : ''}
+              </Badge>
+            ) : null}
             {summaryCounts.map(({ status, value }) => {
               const style = STATUS_STYLE[status];
               return (
@@ -142,6 +258,9 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
                 {text.triggerSource}: {triggerSource}
               </span>
             ) : null}
+            <span className="home-accent-chip px-2 py-0.5 text-xs text-muted-text">
+              {text.inputScope}
+            </span>
             <ChevronDown className="h-4 w-4 shrink-0 text-muted-text transition-transform group-open:rotate-180" aria-hidden="true" />
           </span>
         </summary>
@@ -155,13 +274,21 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
                 <Database className="h-4 w-4" aria-hidden="true" />
               </span>
             )}
-            actions={metadataItems.length > 0 ? (
+            actions={metadataItems.length > 0 || typeof quality?.overallScore === 'number' ? (
               <div className="hidden flex-wrap justify-end gap-2 text-xs text-muted-text md:flex">
+                {typeof quality?.overallScore === 'number' ? (
+                  <span className="home-accent-chip px-2 py-0.5">
+                    {text.qualityScore}: {quality.overallScore}/100{qualityLabel ? ` ${qualityLabel}` : ''}
+                  </span>
+                ) : null}
                 {metadataItems.map((item) => (
                   <span key={item} className="home-accent-chip px-2 py-0.5">
                     {item}
                   </span>
                 ))}
+                <span className="home-accent-chip px-2 py-0.5">
+                  {text.inputScope}
+                </span>
               </div>
             ) : undefined}
           />
@@ -178,6 +305,13 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
                   </Badge>
                 );
               })}
+            </div>
+          ) : null}
+
+          {limitations.length ? (
+            <div className="mb-3 home-subpanel p-3 text-xs leading-5 text-muted-text">
+              <span className="font-medium text-foreground">{text.limitations}: </span>
+              {limitations.join(', ')}
             </div>
           ) : null}
 
@@ -215,7 +349,9 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
                   ) : null}
                   {block.missingReasons?.length ? (
                     <p className="mt-2 text-xs leading-5 text-muted-text">
-                      {text.missingReasons}: {block.missingReasons.join(', ')}
+                      {text.missingReasons}: {block.missingReasons
+                        .map((reason) => formatMissingReason(reason, reportLanguage))
+                        .join(', ')}
                     </p>
                   ) : null}
                 </div>
@@ -223,13 +359,21 @@ export const AnalysisContextSummary: React.FC<AnalysisContextSummaryProps> = ({
             })}
           </div>
 
-          {metadataItems.length > 0 ? (
+          {metadataItems.length > 0 || typeof quality?.overallScore === 'number' ? (
             <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-text md:hidden">
+              {typeof quality?.overallScore === 'number' ? (
+                <span className="home-accent-chip px-2 py-0.5">
+                  {text.qualityScore}: {quality.overallScore}/100{qualityLabel ? ` ${qualityLabel}` : ''}
+                </span>
+              ) : null}
               {metadataItems.map((item) => (
                 <span key={item} className="home-accent-chip px-2 py-0.5">
                   {item}
                 </span>
               ))}
+              <span className="home-accent-chip px-2 py-0.5">
+                {text.inputScope}
+              </span>
             </div>
           ) : null}
         </div>
