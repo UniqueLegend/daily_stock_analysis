@@ -123,7 +123,10 @@ export interface RelatedBoard {
 
 export interface SectorRankingItem {
   name: string;
+  code?: string;
   changePct?: number;
+  source?: string;
+  updatedAt?: string;
 }
 
 export interface SectorRankings {
@@ -175,6 +178,7 @@ export interface MarketReviewPayload {
   breadth?: MarketReviewBreadth;
   indices?: MarketReviewIndex[];
   sectors?: SectorRankings;
+  concepts?: SectorRankings;
   news?: Array<Record<string, unknown>>;
   sections?: MarketReviewPayloadSection[];
   markets?: Record<string, MarketReviewPayload>;
@@ -252,6 +256,7 @@ export interface ReportDetails {
   dividendMetrics?: Record<string, unknown>;
   belongBoards?: RelatedBoard[];
   sectorRankings?: SectorRankings;
+  conceptRankings?: SectorRankings;
 }
 
 /** Full analysis report */
@@ -344,7 +349,7 @@ export type AnalyzeResponse = AnalysisResult | AnalyzeAsyncResponse;
 export interface TaskStatus {
   taskId: string;
   traceId?: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled';
   progress?: number;
   result?: AnalysisResult;
   marketReviewReport?: string;
@@ -363,7 +368,7 @@ export interface TaskInfo {
   traceId?: string;
   stockCode: string;
   stockName?: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled';
   progress: number;
   message?: string;
   reportType: string;
